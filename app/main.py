@@ -1,91 +1,296 @@
 from __future__ import annotations
 
 import json
+import mimetypes
+import os
+import shutil
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.mesh_ops import BoxSpec, erase_boxes, export_glb, load_mesh_from_bytes
+from app.mesh_ops import BoxSpec, erase_boxes, export_obj_asset, load_mesh_from_obj
 
-app = FastAPI(title="Mesh OBB Erase Server", version="1.0.0")
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _safe_rmtree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _copy_tree(src: Path, dst: Path) -> None:
+    _safe_rmtree(dst)
+    shutil.copytree(src, dst)
+
+
+def _etag(scene_id: str, revision: int) -> str:
+    return f"\"{scene_id}-r{revision}\""
+
+
+def _scene_download_url(scene_id: str, entry_file: str) -> str:
+    return f"/v1/scenes/{scene_id}/assets/current/{entry_file}"
+
+
+@dataclass
+class SceneMetadata:
+    scene_id: str
+    source_mesh_id: str
+    current_revision: int
+    original_asset_path: str
+    current_asset_path: str
+    entry_file: str
+    etag: str
+    updated_at: str
 
 
 class BoxRequest(BaseModel):
+    id: str | None = None
     center: list[float] = Field(min_length=3, max_length=3)
     rotation_quat_xyzw: list[float] = Field(min_length=4, max_length=4)
     size: list[float] = Field(min_length=3, max_length=3)
 
 
-class EraseRequest(BaseModel):
+class BindMeshRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    boxes: list[BoxRequest] = Field(min_length=1)
+    mesh_id: str
+
+
+class RebuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_revision: int
+    boxes: list[BoxRequest] = Field(default_factory=list)
     space: str = "mesh_local"
     remove_rule: str = "intersects"
     weld_vertices: bool = True
     recalc_normals: bool = False
 
 
-@app.get("/health")
-def health() -> JSONResponse:
-    return JSONResponse({"ok": True})
+class DataStore:
+    def __init__(self, data_root: Path):
+        self.data_root = data_root
+        self.catalog_dir = data_root / "catalog"
+        self.scenes_dir = data_root / "scenes"
+        self.catalog_file = self.catalog_dir / "meshes.json"
+        self.catalog_dir.mkdir(parents=True, exist_ok=True)
+        self.scenes_dir.mkdir(parents=True, exist_ok=True)
+
+    def load_catalog(self) -> dict:
+        if not self.catalog_file.exists():
+            return {"items": []}
+        return json.loads(self.catalog_file.read_text(encoding="utf-8"))
+
+    def get_mesh(self, mesh_id: str) -> dict:
+        catalog = self.load_catalog()
+        for item in catalog.get("items", []):
+            if item["mesh_id"] == mesh_id:
+                return item
+        raise HTTPException(status_code=404, detail="Mesh not found")
+
+    def scene_dir(self, scene_id: str) -> Path:
+        return self.scenes_dir / scene_id
+
+    def metadata_path(self, scene_id: str) -> Path:
+        return self.scene_dir(scene_id) / "metadata.json"
+
+    def load_scene(self, scene_id: str) -> SceneMetadata | None:
+        path = self.metadata_path(scene_id)
+        if not path.exists():
+            return None
+        return SceneMetadata(**json.loads(path.read_text(encoding="utf-8")))
+
+    def save_scene(self, meta: SceneMetadata) -> None:
+        scene_dir = self.scene_dir(meta.scene_id)
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_path(meta.scene_id).write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
 
 
-@app.post("/v1/mesh/erase-box")
-async def erase_box_endpoint(mesh_file: UploadFile = File(...), request: str = Form(...)) -> Response:
-    try:
-        request_obj = EraseRequest.model_validate_json(request)
-    except ValidationError as exc:
-        raise HTTPException(status_code=422, detail=json.loads(exc.json())) from exc
+def create_app(data_root: Path | None = None) -> FastAPI:
+    root = data_root or Path(os.getenv("MESH_SERVER_DATA_ROOT", "data"))
+    store = DataStore(root)
+    app = FastAPI(title="Mesh OBB Cutter", version="2.0.0")
+    app.state.store = store
 
-    if request_obj.space != "mesh_local":
-        raise HTTPException(status_code=422, detail="Only space='mesh_local' is supported")
+    @app.get("/health")
+    def health() -> JSONResponse:
+        return JSONResponse({"ok": True})
 
-    payload = await mesh_file.read()
-    if not payload:
-        raise HTTPException(status_code=422, detail="mesh_file is empty")
+    @app.get("/v1/meshes")
+    def list_meshes() -> JSONResponse:
+        return JSONResponse(store.load_catalog())
 
-    try:
-        mesh = load_mesh_from_bytes(payload, mesh_file.filename or "upload.glb")
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Failed to load mesh: {exc}") from exc
-
-    boxes = [
-        BoxSpec(
-            center=np.array(box.center, dtype=np.float64),
-            rotation_quat_xyzw=np.array(box.rotation_quat_xyzw, dtype=np.float64),
-            size=np.array(box.size, dtype=np.float64),
+    @app.get("/v1/scenes/{scene_id}/binding")
+    def get_binding(scene_id: str) -> JSONResponse:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            return JSONResponse({"scene_id": scene_id, "bound": False})
+        return JSONResponse(
+            {
+                "scene_id": scene_id,
+                "bound": True,
+                "source_mesh_id": meta.source_mesh_id,
+                "current_revision": meta.current_revision,
+                "etag": meta.etag,
+                "download_url": _scene_download_url(scene_id, meta.entry_file),
+            }
         )
-        for box in request_obj.boxes
-    ]
 
-    try:
-        result_mesh, stats, changed = erase_boxes(mesh, boxes, remove_rule=request_obj.remove_rule)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    @app.post("/v1/scenes/{scene_id}/bind-mesh")
+    def bind_mesh(scene_id: str, request: BindMeshRequest) -> JSONResponse:
+        mesh = store.get_mesh(request.mesh_id)
+        asset_root = Path(mesh["asset_root_path"])
+        if not asset_root.exists():
+            raise HTTPException(status_code=500, detail="Catalog asset root is missing")
 
-    if stats.triangles_after == 0:
-        raise HTTPException(status_code=422, detail="Mesh is empty after erase")
+        scene_dir = store.scene_dir(scene_id)
+        original_dir = scene_dir / "original"
+        current_dir = scene_dir / "current"
+        scene_dir.mkdir(parents=True, exist_ok=True)
+        _copy_tree(asset_root, original_dir)
+        _copy_tree(asset_root, current_dir)
 
-    if request_obj.weld_vertices:
-        result_mesh.merge_vertices()
-        result_mesh.remove_unreferenced_vertices()
+        revision = 1
+        meta = SceneMetadata(
+            scene_id=scene_id,
+            source_mesh_id=request.mesh_id,
+            current_revision=revision,
+            original_asset_path=str(original_dir),
+            current_asset_path=str(current_dir),
+            entry_file=mesh["entry_file"],
+            etag=_etag(scene_id, revision),
+            updated_at=_utc_now(),
+        )
+        store.save_scene(meta)
+        return JSONResponse(
+            {
+                "scene_id": scene_id,
+                "bound": True,
+                "source_mesh_id": meta.source_mesh_id,
+                "current_revision": meta.current_revision,
+                "etag": meta.etag,
+                "download_url": _scene_download_url(scene_id, meta.entry_file),
+            }
+        )
 
-    if request_obj.recalc_normals:
-        _ = result_mesh.vertex_normals
+    @app.get("/v1/scenes/{scene_id}/assets/current/{asset_path:path}")
+    def get_current_asset(scene_id: str, asset_path: str, request: Request) -> Response:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Scene is not bound")
 
-    if not changed and (mesh_file.filename or "").lower().endswith(".glb"):
-        output = payload
-    else:
-        output = export_glb(result_mesh)
+        current_root = Path(meta.current_asset_path).resolve()
+        resolved = (current_root / asset_path).resolve()
+        if current_root not in resolved.parents and resolved != current_root:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        if not resolved.exists() or not resolved.is_file():
+            raise HTTPException(status_code=404, detail="Asset not found")
 
-    headers = {
-        "X-Vertices-Before": str(stats.vertices_before),
-        "X-Vertices-After": str(len(result_mesh.vertices)),
-        "X-Triangles-Before": str(stats.triangles_before),
-        "X-Triangles-After": str(len(result_mesh.faces)),
-    }
+        if request.headers.get("if-none-match") == meta.etag:
+            return Response(status_code=304, headers={"ETag": meta.etag})
 
-    return Response(content=output, media_type="application/octet-stream", headers=headers)
+        media_type, _ = mimetypes.guess_type(str(resolved))
+        return FileResponse(
+            resolved,
+            media_type=media_type or "application/octet-stream",
+            headers={"ETag": meta.etag},
+        )
+
+    @app.post("/v1/scenes/{scene_id}/rebuild-from-boxes")
+    def rebuild_from_boxes(scene_id: str, request: RebuildRequest) -> JSONResponse:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Scene is not bound")
+        if request.space != "mesh_local":
+            raise HTTPException(status_code=422, detail="Only space='mesh_local' is supported")
+        if request.base_revision != meta.current_revision:
+            return JSONResponse(
+                status_code=409,
+                content={"detail": "Revision conflict", "current_revision": meta.current_revision},
+            )
+
+        original_root = Path(meta.original_asset_path)
+        original_obj = original_root / meta.entry_file
+        if not original_obj.exists():
+            raise HTTPException(status_code=500, detail="Original entry file is missing")
+
+        next_revision = meta.current_revision + 1
+        current_root = Path(meta.current_asset_path)
+
+        if not request.boxes:
+            _copy_tree(original_root, current_root)
+        else:
+            mesh, obj_info = load_mesh_from_obj(original_obj)
+            boxes = [
+                BoxSpec(
+                    center=np.array(box.center, dtype=np.float64),
+                    rotation_quat_xyzw=np.array(box.rotation_quat_xyzw, dtype=np.float64),
+                    size=np.array(box.size, dtype=np.float64),
+                )
+                for box in request.boxes
+            ]
+
+            try:
+                result_mesh, stats, _ = erase_boxes(mesh, boxes, remove_rule=request.remove_rule)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+            if stats.triangles_after == 0:
+                raise HTTPException(status_code=422, detail="Mesh processing produced an empty result")
+
+            if request.weld_vertices:
+                result_mesh.merge_vertices()
+                result_mesh.remove_unreferenced_vertices()
+            if request.recalc_normals:
+                _ = result_mesh.vertex_normals
+
+            export_obj_asset(result_mesh, obj_info, original_root, current_root, meta.entry_file)
+
+        meta.current_revision = next_revision
+        meta.etag = _etag(scene_id, next_revision)
+        meta.updated_at = _utc_now()
+        store.save_scene(meta)
+
+        return JSONResponse(
+            {
+                "scene_id": scene_id,
+                "new_revision": meta.current_revision,
+                "etag": meta.etag,
+                "download_url": _scene_download_url(scene_id, meta.entry_file),
+            }
+        )
+
+    @app.post("/v1/scenes/{scene_id}/reset-to-original")
+    def reset_to_original(scene_id: str) -> JSONResponse:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Scene is not bound")
+
+        original_root = Path(meta.original_asset_path)
+        current_root = Path(meta.current_asset_path)
+        _copy_tree(original_root, current_root)
+
+        meta.current_revision += 1
+        meta.etag = _etag(scene_id, meta.current_revision)
+        meta.updated_at = _utc_now()
+        store.save_scene(meta)
+        return JSONResponse(
+            {
+                "scene_id": scene_id,
+                "new_revision": meta.current_revision,
+                "etag": meta.etag,
+                "download_url": _scene_download_url(scene_id, meta.entry_file),
+            }
+        )
+
+    return app
+
+
+app = create_app()

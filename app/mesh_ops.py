@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import io
-import tempfile
-import zipfile
+import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -26,6 +25,13 @@ class MeshStats:
     triangles_after: int
 
 
+@dataclass(frozen=True)
+class ObjAssetInfo:
+    mtllib: str | None
+    material_name: str | None
+    texture_refs: tuple[str, ...]
+
+
 def _xyzw_to_wxyz(quat_xyzw: np.ndarray) -> np.ndarray:
     return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
 
@@ -46,7 +52,6 @@ def _axis_overlaps(points: np.ndarray, axis: np.ndarray, half_size: np.ndarray) 
 
 
 def _triangle_box_intersect_local(tri: np.ndarray, half_size: np.ndarray) -> bool:
-    # SAT implementation derived from Akenine-Moller tri-box overlap test.
     v0 = tri[0]
     v1 = tri[1]
     v2 = tri[2]
@@ -55,7 +60,6 @@ def _triangle_box_intersect_local(tri: np.ndarray, half_size: np.ndarray) -> boo
     e1 = v2 - v1
     e2 = v0 - v2
 
-    # 9 cross-product axes (triangle edges x box axes)
     basis = np.eye(3)
     for edge in (e0, e1, e2):
         for b in basis:
@@ -63,13 +67,11 @@ def _triangle_box_intersect_local(tri: np.ndarray, half_size: np.ndarray) -> boo
             if not _axis_overlaps(tri, axis, half_size):
                 return False
 
-    # 3 box face axes
     tri_min = np.min(tri, axis=0)
     tri_max = np.max(tri, axis=0)
     if np.any(tri_min > half_size) or np.any(tri_max < -half_size):
         return False
 
-    # Triangle face normal
     normal = np.cross(e0, e1)
     if not _axis_overlaps(tri, normal, half_size):
         return False
@@ -140,50 +142,99 @@ def erase_boxes(
     return new_mesh, stats, True
 
 
-def _resolve_scene_to_mesh(scene: trimesh.Scene) -> trimesh.Trimesh:
-    if len(scene.geometry) == 0:
-        return trimesh.Trimesh(vertices=np.empty((0, 3)), faces=np.empty((0, 3), dtype=np.int64))
-
-    if len(scene.geometry) == 1:
-        return next(iter(scene.geometry.values())).copy()
-
-    merged = scene.dump(concatenate=True)
-    if isinstance(merged, trimesh.Trimesh):
-        return merged
-    raise ValueError("Unable to resolve scene geometry")
-
-
-def load_mesh_from_bytes(data: bytes, filename: str) -> trimesh.Trimesh:
-    suffix = Path(filename).suffix.lower()
-
-    if suffix in {".glb", ".gltf", ".obj"}:
-        loaded = trimesh.load(io.BytesIO(data), file_type=suffix.lstrip("."), force="scene")
-    elif suffix == ".zip":
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-                zf.extractall(temp_dir)
-            obj_candidates = list(Path(temp_dir).rglob("*.obj"))
-            if not obj_candidates:
-                raise ValueError("ZIP must contain at least one .obj file")
-            loaded = trimesh.load(str(obj_candidates[0]), file_type="obj", force="scene")
-    else:
-        raise ValueError("Unsupported mesh format. Use .glb, .gltf, .obj or .zip")
-
-    if isinstance(loaded, trimesh.Scene):
-        mesh = _resolve_scene_to_mesh(loaded)
-    elif isinstance(loaded, trimesh.Trimesh):
-        mesh = loaded
-    else:
-        raise ValueError("Uploaded file did not contain a valid mesh")
-
-    mesh.process(validate=False)
-    return mesh
+def _parse_obj_asset_info(obj_path: Path) -> ObjAssetInfo:
+    mtllib = None
+    material_name = None
+    for line in obj_path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("mtllib ") and mtllib is None:
+            mtllib = stripped.split(None, 1)[1]
+        elif stripped.startswith("usemtl ") and material_name is None:
+            material_name = stripped.split(None, 1)[1]
+    texture_refs: list[str] = []
+    if mtllib:
+        mtl_path = (obj_path.parent / mtllib).resolve()
+        if mtl_path.exists():
+            for line in mtl_path.read_text(encoding="utf-8").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("map_Kd "):
+                    texture_refs.append(stripped.split(None, 1)[1])
+    return ObjAssetInfo(mtllib=mtllib, material_name=material_name, texture_refs=tuple(texture_refs))
 
 
-def export_glb(mesh: trimesh.Trimesh) -> bytes:
-    exported = mesh.export(file_type="glb")
-    if isinstance(exported, bytes):
-        return exported
-    if isinstance(exported, str):
-        return exported.encode("utf-8")
-    raise RuntimeError("GLB export failed")
+def load_mesh_from_obj(obj_path: Path) -> tuple[trimesh.Trimesh, ObjAssetInfo]:
+    loaded = trimesh.load(str(obj_path), file_type="obj", force="mesh")
+    if not isinstance(loaded, trimesh.Trimesh):
+        raise ValueError("OBJ did not contain a valid mesh")
+    loaded.process(validate=False)
+    return loaded, _parse_obj_asset_info(obj_path)
+
+
+def _copy_asset_dependencies(original_root: Path, current_root: Path, entry_file: str) -> None:
+    _safe_delete(current_root)
+    shutil.copytree(original_root, current_root)
+    target_obj = current_root / entry_file
+    if not target_obj.exists():
+        raise ValueError("Entry OBJ is missing from copied asset")
+
+
+def _safe_delete(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _format_vertex(values: np.ndarray) -> str:
+    return " ".join(f"{float(v):.8f}".rstrip("0").rstrip(".") if abs(float(v)) >= 1e-8 else "0" for v in values)
+
+
+def export_obj_asset(
+    mesh: trimesh.Trimesh,
+    obj_info: ObjAssetInfo,
+    original_root: Path,
+    current_root: Path,
+    entry_file: str,
+) -> None:
+    _copy_asset_dependencies(original_root, current_root, entry_file)
+    obj_out = current_root / entry_file
+
+    uv = getattr(mesh.visual, "uv", None)
+    normals = None
+    try:
+        normals = mesh.vertex_normals
+    except Exception:
+        normals = None
+
+    lines: list[str] = []
+    if obj_info.mtllib:
+        lines.append(f"mtllib {obj_info.mtllib}")
+    if obj_info.material_name:
+        lines.append(f"usemtl {obj_info.material_name}")
+
+    for vertex in np.asarray(mesh.vertices):
+        lines.append(f"v {_format_vertex(vertex)}")
+
+    if uv is not None:
+        for tex in np.asarray(uv):
+            lines.append(f"vt {_format_vertex(np.asarray(tex)[:2])}")
+
+    if normals is not None and len(normals) == len(mesh.vertices):
+        for normal in np.asarray(normals):
+            lines.append(f"vn {_format_vertex(normal)}")
+
+    has_uv = uv is not None and len(uv) == len(mesh.vertices)
+    has_normals = normals is not None and len(normals) == len(mesh.vertices)
+    for face in np.asarray(mesh.faces):
+        indices = face + 1
+        parts: list[str] = []
+        for index in indices:
+            if has_uv and has_normals:
+                parts.append(f"{index}/{index}/{index}")
+            elif has_uv:
+                parts.append(f"{index}/{index}")
+            elif has_normals:
+                parts.append(f"{index}//{index}")
+            else:
+                parts.append(str(index))
+        lines.append(f"f {' '.join(parts)}")
+
+    obj_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
