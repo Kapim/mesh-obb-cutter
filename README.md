@@ -19,6 +19,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+`scipy` is included in `requirements.txt` because `trimesh` uses it when computing vertex normals.
+
 ## Data Layout
 
 Default data root is `./data` and contains:
