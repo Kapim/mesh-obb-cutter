@@ -20,6 +20,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 `scipy` is included in `requirements.txt` because `trimesh` uses it when computing vertex normals.
+`Pillow` is included for textured OBJ/MTL assets and image handling used by the mesh pipeline.
 
 ## Data Layout
 
