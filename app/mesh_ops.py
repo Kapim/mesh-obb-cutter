@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import trimesh
+
+logger = logging.getLogger("mesh_obb_cutter.mesh_ops")
 
 
 @dataclass(frozen=True)
@@ -79,11 +83,33 @@ def _triangle_box_intersect_local(tri: np.ndarray, half_size: np.ndarray) -> boo
     return True
 
 
-def _boxes_triangle_mask(mesh: trimesh.Trimesh, boxes: Iterable[BoxSpec]) -> np.ndarray:
+def _boxes_triangle_mask(
+    mesh: trimesh.Trimesh,
+    boxes: Iterable[BoxSpec],
+    progress_callback: Callable[[str], None] | None = None,
+    progress_interval_seconds: float = 5.0,
+) -> np.ndarray:
     triangles = mesh.triangles
+    boxes = list(boxes)
     remove_mask = np.zeros(len(triangles), dtype=bool)
+    total_boxes = len(boxes)
+    total_triangles = len(triangles)
+    total_checks = max(total_boxes * total_triangles, 1)
+    checks_done = 0
+    last_progress_at = time.monotonic()
 
-    for box in boxes:
+    def emit_progress(message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(message)
+            return
+        logger.info(message)
+
+    emit_progress(
+        "Cutting started: %d boxes across %d triangles (%d planned box-triangle checks)"
+        % (total_boxes, total_triangles, total_checks)
+    )
+
+    for box_index, box in enumerate(boxes, start=1):
         transform = _box_transform(box)
         inv_transform = np.linalg.inv(transform)
         half_size = box.size / 2.0
@@ -94,15 +120,55 @@ def _boxes_triangle_mask(mesh: trimesh.Trimesh, boxes: Iterable[BoxSpec]) -> np.
         )
         local = (inv_transform @ tri_h.T).T[:, :3].reshape(-1, 3, 3)
 
-        for idx in np.where(~remove_mask)[0]:
+        pending_indices = np.where(~remove_mask)[0]
+        if len(pending_indices) == 0:
+            emit_progress(
+                "Cutting finished early after box %d/%d: all triangles already marked for removal"
+                % (box_index, total_boxes)
+            )
+            break
+
+        for pending_index, idx in enumerate(pending_indices, start=1):
             if _triangle_box_intersect_local(local[idx], half_size):
                 remove_mask[idx] = True
+            checks_done += 1
+
+            now = time.monotonic()
+            if now - last_progress_at >= progress_interval_seconds:
+                percent = min(99.0, 100.0 * checks_done / total_checks)
+                emit_progress(
+                    "Cutting progress: %.1f%% (%d/%d checks), box %d/%d, box-local triangle %d/%d, removed %d triangles"
+                    % (
+                        percent,
+                        checks_done,
+                        total_checks,
+                        box_index,
+                        total_boxes,
+                        pending_index,
+                        len(pending_indices),
+                        int(np.count_nonzero(remove_mask)),
+                    )
+                )
+                last_progress_at = now
+
+        emit_progress(
+            "Completed box %d/%d: removed %d/%d triangles so far"
+            % (box_index, total_boxes, int(np.count_nonzero(remove_mask)), total_triangles)
+        )
+
+    emit_progress(
+        "Cutting finished: removed %d/%d triangles"
+        % (int(np.count_nonzero(remove_mask)), total_triangles)
+    )
 
     return remove_mask
 
 
 def erase_boxes(
-    mesh: trimesh.Trimesh, boxes: list[BoxSpec], remove_rule: str = "intersects"
+    mesh: trimesh.Trimesh,
+    boxes: list[BoxSpec],
+    remove_rule: str = "intersects",
+    progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[trimesh.Trimesh, MeshStats, bool]:
     if remove_rule != "intersects":
         raise ValueError(f"Unsupported remove_rule: {remove_rule}")
@@ -114,7 +180,7 @@ def erase_boxes(
         stats = MeshStats(vertices_before, vertices_before, triangles_before, triangles_before)
         return mesh.copy(), stats, False
 
-    remove_mask = _boxes_triangle_mask(mesh, boxes)
+    remove_mask = _boxes_triangle_mask(mesh, boxes, progress_callback=progress_callback)
     removed_count = int(np.count_nonzero(remove_mask))
 
     if removed_count == 0:

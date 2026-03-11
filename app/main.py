@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import os
 import shutil
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +16,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.mesh_ops import BoxSpec, erase_boxes, export_obj_asset, load_mesh_from_obj
+
+logger = logging.getLogger("mesh_obb_cutter")
+_LOG_LEVEL = os.getenv("MESH_CUTTER_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _LOG_LEVEL, logging.INFO))
 
 
 def _utc_now() -> str:
@@ -119,6 +125,29 @@ def create_app(data_root: Path | None = None) -> FastAPI:
     app = FastAPI(title="Mesh OBB Cutter", version="2.0.0")
     app.state.store = store
 
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        started = time.monotonic()
+        logger.info("HTTP %s %s started", request.method, request.url.path)
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration = time.monotonic() - started
+            logger.exception(
+                "HTTP %s %s failed after %.2fs", request.method, request.url.path, duration
+            )
+            raise
+
+        duration = time.monotonic() - started
+        logger.info(
+            "HTTP %s %s completed with %d in %.2fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
+        return response
+
     @app.get("/health")
     def health() -> JSONResponse:
         return JSONResponse({"ok": True})
@@ -205,6 +234,16 @@ def create_app(data_root: Path | None = None) -> FastAPI:
 
     @app.post("/v1/scenes/{scene_id}/rebuild-from-boxes")
     def rebuild_from_boxes(scene_id: str, request: RebuildRequest) -> JSONResponse:
+        started = time.monotonic()
+        logger.info(
+            "Rebuild requested for scene=%s base_revision=%d boxes=%d weld_vertices=%s recalc_normals=%s remove_rule=%s",
+            scene_id,
+            request.base_revision,
+            len(request.boxes),
+            request.weld_vertices,
+            request.recalc_normals,
+            request.remove_rule,
+        )
         meta = store.load_scene(scene_id)
         if meta is None:
             raise HTTPException(status_code=404, detail="Scene is not bound")
@@ -225,9 +264,17 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         current_root = Path(meta.current_asset_path)
 
         if not request.boxes:
+            logger.info("Rebuild for scene=%s has no boxes, restoring original asset", scene_id)
             _copy_tree(original_root, current_root)
         else:
+            logger.info("Loading source OBJ for scene=%s from %s", scene_id, original_obj)
             mesh, obj_info = load_mesh_from_obj(original_obj)
+            logger.info(
+                "Loaded mesh for scene=%s: vertices=%d triangles=%d",
+                scene_id,
+                len(mesh.vertices),
+                len(mesh.faces),
+            )
             boxes = [
                 BoxSpec(
                     center=np.array(box.center, dtype=np.float64),
@@ -238,25 +285,47 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             ]
 
             try:
-                result_mesh, stats, _ = erase_boxes(mesh, boxes, remove_rule=request.remove_rule)
+                result_mesh, stats, _ = erase_boxes(
+                    mesh,
+                    boxes,
+                    remove_rule=request.remove_rule,
+                    progress_callback=lambda message: logger.info("scene=%s %s", scene_id, message),
+                )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+            logger.info(
+                "Cut completed for scene=%s: triangles %d -> %d, vertices %d -> %d",
+                scene_id,
+                stats.triangles_before,
+                stats.triangles_after,
+                stats.vertices_before,
+                stats.vertices_after,
+            )
             if stats.triangles_after == 0:
                 raise HTTPException(status_code=422, detail="Mesh processing produced an empty result")
 
             if request.weld_vertices:
+                logger.info("Welding vertices for scene=%s", scene_id)
                 result_mesh.merge_vertices()
                 result_mesh.remove_unreferenced_vertices()
             if request.recalc_normals:
+                logger.info("Recalculating normals for scene=%s", scene_id)
                 _ = result_mesh.vertex_normals
 
+            logger.info("Exporting rebuilt OBJ asset for scene=%s", scene_id)
             export_obj_asset(result_mesh, obj_info, original_root, current_root, meta.entry_file)
 
         meta.current_revision = next_revision
         meta.etag = _etag(scene_id, next_revision)
         meta.updated_at = _utc_now()
         store.save_scene(meta)
+        logger.info(
+            "Rebuild finished for scene=%s new_revision=%d in %.2fs",
+            scene_id,
+            meta.current_revision,
+            time.monotonic() - started,
+        )
 
         return JSONResponse(
             {
