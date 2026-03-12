@@ -109,6 +109,7 @@ def test_bind_creates_original_and_current_with_revision_one(tmp_path: Path):
     assert body["etag"] == f"\"{scene_id}-r1\""
     assert body["download_url"].endswith("/mesh.obj")
     assert body["relative_position"] == [0.0, 0.0, 0.0]
+    assert body["relative_rotation_quat_xyzw"] == [0.0, 0.0, 0.0, 1.0]
 
     obj = client.get(body["download_url"])
     mtl = client.get(f"/v1/scenes/{scene_id}/assets/current/mesh.mtl")
@@ -122,24 +123,33 @@ def test_bind_creates_original_and_current_with_revision_one(tmp_path: Path):
     assert "map_Kd textures/texture.png" in mtl.text
 
 
-def test_mesh_position_can_be_persisted_per_scene(tmp_path: Path):
+def test_mesh_transform_can_be_persisted_per_scene(tmp_path: Path):
     client = _make_client(tmp_path)
     scene_id = "scn_position"
     client.post(f"/v1/scenes/{scene_id}/bind-mesh", json={"mesh_id": "scan-room-a-raw"})
 
     update = client.put(
-        f"/v1/scenes/{scene_id}/mesh-position",
-        json={"relative_position": [1.25, -0.5, 3.0]},
+        f"/v1/scenes/{scene_id}/mesh-transform",
+        json={
+            "relative_position": [1.25, -0.5, 3.0],
+            "relative_rotation_quat_xyzw": [0.0, 0.707, 0.0, 0.707],
+        },
     )
     binding = client.get(f"/v1/scenes/{scene_id}/binding")
-    position = client.get(f"/v1/scenes/{scene_id}/mesh-position")
+    transform = client.get(f"/v1/scenes/{scene_id}/mesh-transform")
+    legacy = client.get(f"/v1/scenes/{scene_id}/mesh-position")
 
     assert update.status_code == 200
     assert update.json()["relative_position"] == [1.25, -0.5, 3.0]
+    assert update.json()["relative_rotation_quat_xyzw"] == [0.0, 0.707, 0.0, 0.707]
     assert binding.status_code == 200
     assert binding.json()["relative_position"] == [1.25, -0.5, 3.0]
-    assert position.status_code == 200
-    assert position.json()["relative_position"] == [1.25, -0.5, 3.0]
+    assert binding.json()["relative_rotation_quat_xyzw"] == [0.0, 0.707, 0.0, 0.707]
+    assert transform.status_code == 200
+    assert transform.json()["relative_position"] == [1.25, -0.5, 3.0]
+    assert transform.json()["relative_rotation_quat_xyzw"] == [0.0, 0.707, 0.0, 0.707]
+    assert legacy.status_code == 200
+    assert legacy.json()["relative_rotation_quat_xyzw"] == [0.0, 0.707, 0.0, 0.707]
 
 
 def test_rebuild_from_original_changes_revision_and_geometry(tmp_path: Path):

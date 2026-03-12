@@ -55,6 +55,7 @@ class SceneMetadata:
     etag: str
     updated_at: str
     relative_position: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    relative_rotation_quat_xyzw: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 1.0])
 
 
 class BoxRequest(BaseModel):
@@ -81,10 +82,11 @@ class RebuildRequest(BaseModel):
     recalc_normals: bool = False
 
 
-class MeshPositionRequest(BaseModel):
+class MeshTransformRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     relative_position: list[float] = Field(min_length=3, max_length=3)
+    relative_rotation_quat_xyzw: list[float] = Field(min_length=4, max_length=4)
 
 
 def _binding_payload(meta: SceneMetadata) -> dict:
@@ -96,6 +98,16 @@ def _binding_payload(meta: SceneMetadata) -> dict:
         "etag": meta.etag,
         "download_url": _scene_download_url(meta.scene_id, meta.entry_file),
         "relative_position": meta.relative_position,
+        "relative_rotation_quat_xyzw": meta.relative_rotation_quat_xyzw,
+    }
+
+
+def _mesh_transform_payload(meta: SceneMetadata) -> dict:
+    return {
+        "scene_id": meta.scene_id,
+        "relative_position": meta.relative_position,
+        "relative_rotation_quat_xyzw": meta.relative_rotation_quat_xyzw,
+        "updated_at": meta.updated_at,
     }
 
 
@@ -205,41 +217,41 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             current_asset_path=str(current_dir),
             entry_file=mesh["entry_file"],
             relative_position=[0.0, 0.0, 0.0],
+            relative_rotation_quat_xyzw=[0.0, 0.0, 0.0, 1.0],
             etag=_etag(scene_id, revision),
             updated_at=_utc_now(),
         )
         store.save_scene(meta)
         return JSONResponse(_binding_payload(meta))
 
-    @app.get("/v1/scenes/{scene_id}/mesh-position")
-    def get_mesh_position(scene_id: str) -> JSONResponse:
+    @app.get("/v1/scenes/{scene_id}/mesh-transform")
+    def get_mesh_transform(scene_id: str) -> JSONResponse:
         meta = store.load_scene(scene_id)
         if meta is None:
             raise HTTPException(status_code=404, detail="Scene is not bound")
-        return JSONResponse(
-            {
-                "scene_id": scene_id,
-                "relative_position": meta.relative_position,
-                "updated_at": meta.updated_at,
-            }
-        )
+        return JSONResponse(_mesh_transform_payload(meta))
 
-    @app.put("/v1/scenes/{scene_id}/mesh-position")
-    def update_mesh_position(scene_id: str, request: MeshPositionRequest) -> JSONResponse:
+    @app.put("/v1/scenes/{scene_id}/mesh-transform")
+    def update_mesh_transform(scene_id: str, request: MeshTransformRequest) -> JSONResponse:
         meta = store.load_scene(scene_id)
         if meta is None:
             raise HTTPException(status_code=404, detail="Scene is not bound")
 
         meta.relative_position = [float(value) for value in request.relative_position]
+        meta.relative_rotation_quat_xyzw = [
+            float(value) for value in request.relative_rotation_quat_xyzw
+        ]
         meta.updated_at = _utc_now()
         store.save_scene(meta)
-        return JSONResponse(
-            {
-                "scene_id": scene_id,
-                "relative_position": meta.relative_position,
-                "updated_at": meta.updated_at,
-            }
-        )
+        return JSONResponse(_mesh_transform_payload(meta))
+
+    @app.get("/v1/scenes/{scene_id}/mesh-position")
+    def get_mesh_position(scene_id: str) -> JSONResponse:
+        return get_mesh_transform(scene_id)
+
+    @app.put("/v1/scenes/{scene_id}/mesh-position")
+    def update_mesh_position(scene_id: str, request: MeshTransformRequest) -> JSONResponse:
+        return update_mesh_transform(scene_id, request)
 
     @app.get("/v1/scenes/{scene_id}/assets/current/{asset_path:path}")
     def get_current_asset(scene_id: str, asset_path: str, request: Request) -> Response:

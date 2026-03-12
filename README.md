@@ -3,7 +3,7 @@
 FastAPI server implementing the scene-based mesh workflow from `ASSIGNMENT.md`.
 
 The server binds a catalog mesh asset to a `scene_id`, stores immutable `original` and mutable `current` copies on disk, and rebuilds `current` from `original` plus the full snapshot of collision boxes sent by the client.
-It also stores a per-scene GUI-controlled `relative_position` for placing the mesh in the client.
+It also stores a per-scene GUI-controlled relative transform for placing the mesh in the client.
 
 The current MVP contract is built around `OBJ + MTL + texture` so the Unity client can load:
 
@@ -62,6 +62,8 @@ You can override the data root with `MESH_SERVER_DATA_ROOT`.
 - `GET /v1/meshes`
 - `GET /v1/scenes/{scene_id}/binding`
 - `POST /v1/scenes/{scene_id}/bind-mesh`
+- `GET /v1/scenes/{scene_id}/mesh-transform`
+- `PUT /v1/scenes/{scene_id}/mesh-transform`
 - `GET /v1/scenes/{scene_id}/mesh-position`
 - `PUT /v1/scenes/{scene_id}/mesh-position`
 - `GET /v1/scenes/{scene_id}/assets/current/{asset_path}`
@@ -75,7 +77,7 @@ You can override the data root with `MESH_SERVER_DATA_ROOT`.
 - Empty `boxes` restores `current` to the same shape as `original`.
 - `base_revision` is checked for optimistic concurrency.
 - `ETag` is updated whenever `current` changes.
-- `relative_position` is stored separately per scene and does not change `revision` or `ETag`.
+- `relative_position` and `relative_rotation_quat_xyzw` are stored separately per scene and do not change `revision` or `ETag`.
 
 Example rebuild request:
 
