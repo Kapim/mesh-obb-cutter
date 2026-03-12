@@ -6,7 +6,7 @@ import mimetypes
 import os
 import shutil
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +54,7 @@ class SceneMetadata:
     entry_file: str
     etag: str
     updated_at: str
+    relative_position: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
 
 
 class BoxRequest(BaseModel):
@@ -78,6 +79,24 @@ class RebuildRequest(BaseModel):
     remove_rule: str = "intersects"
     weld_vertices: bool = True
     recalc_normals: bool = False
+
+
+class MeshPositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    relative_position: list[float] = Field(min_length=3, max_length=3)
+
+
+def _binding_payload(meta: SceneMetadata) -> dict:
+    return {
+        "scene_id": meta.scene_id,
+        "bound": True,
+        "source_mesh_id": meta.source_mesh_id,
+        "current_revision": meta.current_revision,
+        "etag": meta.etag,
+        "download_url": _scene_download_url(meta.scene_id, meta.entry_file),
+        "relative_position": meta.relative_position,
+    }
 
 
 class DataStore:
@@ -161,16 +180,7 @@ def create_app(data_root: Path | None = None) -> FastAPI:
         meta = store.load_scene(scene_id)
         if meta is None:
             return JSONResponse({"scene_id": scene_id, "bound": False})
-        return JSONResponse(
-            {
-                "scene_id": scene_id,
-                "bound": True,
-                "source_mesh_id": meta.source_mesh_id,
-                "current_revision": meta.current_revision,
-                "etag": meta.etag,
-                "download_url": _scene_download_url(scene_id, meta.entry_file),
-            }
-        )
+        return JSONResponse(_binding_payload(meta))
 
     @app.post("/v1/scenes/{scene_id}/bind-mesh")
     def bind_mesh(scene_id: str, request: BindMeshRequest) -> JSONResponse:
@@ -194,18 +204,40 @@ def create_app(data_root: Path | None = None) -> FastAPI:
             original_asset_path=str(original_dir),
             current_asset_path=str(current_dir),
             entry_file=mesh["entry_file"],
+            relative_position=[0.0, 0.0, 0.0],
             etag=_etag(scene_id, revision),
             updated_at=_utc_now(),
         )
         store.save_scene(meta)
+        return JSONResponse(_binding_payload(meta))
+
+    @app.get("/v1/scenes/{scene_id}/mesh-position")
+    def get_mesh_position(scene_id: str) -> JSONResponse:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Scene is not bound")
         return JSONResponse(
             {
                 "scene_id": scene_id,
-                "bound": True,
-                "source_mesh_id": meta.source_mesh_id,
-                "current_revision": meta.current_revision,
-                "etag": meta.etag,
-                "download_url": _scene_download_url(scene_id, meta.entry_file),
+                "relative_position": meta.relative_position,
+                "updated_at": meta.updated_at,
+            }
+        )
+
+    @app.put("/v1/scenes/{scene_id}/mesh-position")
+    def update_mesh_position(scene_id: str, request: MeshPositionRequest) -> JSONResponse:
+        meta = store.load_scene(scene_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Scene is not bound")
+
+        meta.relative_position = [float(value) for value in request.relative_position]
+        meta.updated_at = _utc_now()
+        store.save_scene(meta)
+        return JSONResponse(
+            {
+                "scene_id": scene_id,
+                "relative_position": meta.relative_position,
+                "updated_at": meta.updated_at,
             }
         )
 

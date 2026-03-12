@@ -108,6 +108,7 @@ def test_bind_creates_original_and_current_with_revision_one(tmp_path: Path):
     assert body["current_revision"] == 1
     assert body["etag"] == f"\"{scene_id}-r1\""
     assert body["download_url"].endswith("/mesh.obj")
+    assert body["relative_position"] == [0.0, 0.0, 0.0]
 
     obj = client.get(body["download_url"])
     mtl = client.get(f"/v1/scenes/{scene_id}/assets/current/mesh.mtl")
@@ -119,6 +120,26 @@ def test_bind_creates_original_and_current_with_revision_one(tmp_path: Path):
     assert obj.headers["etag"] == f"\"{scene_id}-r1\""
     assert "mtllib mesh.mtl" in obj.text
     assert "map_Kd textures/texture.png" in mtl.text
+
+
+def test_mesh_position_can_be_persisted_per_scene(tmp_path: Path):
+    client = _make_client(tmp_path)
+    scene_id = "scn_position"
+    client.post(f"/v1/scenes/{scene_id}/bind-mesh", json={"mesh_id": "scan-room-a-raw"})
+
+    update = client.put(
+        f"/v1/scenes/{scene_id}/mesh-position",
+        json={"relative_position": [1.25, -0.5, 3.0]},
+    )
+    binding = client.get(f"/v1/scenes/{scene_id}/binding")
+    position = client.get(f"/v1/scenes/{scene_id}/mesh-position")
+
+    assert update.status_code == 200
+    assert update.json()["relative_position"] == [1.25, -0.5, 3.0]
+    assert binding.status_code == 200
+    assert binding.json()["relative_position"] == [1.25, -0.5, 3.0]
+    assert position.status_code == 200
+    assert position.json()["relative_position"] == [1.25, -0.5, 3.0]
 
 
 def test_rebuild_from_original_changes_revision_and_geometry(tmp_path: Path):
